@@ -1,0 +1,221 @@
+"""
+Natural Gas Price Estimator
+===========================
+Uses monthly snapshot data (Oct 2020 – Sep 2024) to:
+  • Interpolate prices for any historical date
+  • Extrapolate prices one year beyond the data (to Sep 2025)
+
+Model: Linear trend + seasonal (annual sine) component fitted via OLS.
+       Interpolation inside the data range uses cubic spline for accuracy.
+       Extrapolation uses the trend+seasonal model.
+
+Usage:
+    python nat_gas_pricer.py                 # runs demo + saves plot
+    python nat_gas_pricer.py 2023-06-15      # returns estimate for that date
+"""
+
+import sys
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.interpolate import CubicSpline
+from scipy.optimize import curve_fit
+from datetime import datetime, timedelta
+
+warnings.filterwarnings("ignore")
+
+# ── 1. Load & parse data ───────────────────────────────────────────────────────
+DATA_PATH = "/mnt/user-data/uploads/Nat_Gas.csv"
+
+def load_data(path=DATA_PATH):
+    df = pd.read_csv(path)
+    df.columns = ["Date", "Price"]
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=False)
+    df = df.sort_values("Date").reset_index(drop=True)
+    return df
+
+# ── 2. Build model ─────────────────────────────────────────────────────────────
+def build_model(df):
+    """
+    Fit: Price(t) = a + b*t + c*sin(2π*t/T) + d*cos(2π*t/T)
+    where t = years elapsed since first data point, T = 1 year.
+    Returns (spline, trend_fn, t0, t_end_data)
+    """
+    t0 = df["Date"].iloc[0]
+
+    # Numeric time in years
+    def to_t(dates):
+        return (pd.to_datetime(dates) - t0).dt.total_seconds() / (365.25 * 86400)
+
+    df = df.copy()
+    df["t"] = to_t(df["Date"])
+
+    # Trend + seasonal model
+    def model(t, a, b, c, d):
+        return a + b * t + c * np.sin(2 * np.pi * t) + d * np.cos(2 * np.pi * t)
+
+    popt, _ = curve_fit(model, df["t"].values, df["Price"].values, p0=[10, 0.5, 0.3, 0.3])
+
+    # Cubic spline over observed points for interpolation
+    spline = CubicSpline(df["t"].values, df["Price"].values, extrapolate=False)
+
+    t_end = df["t"].iloc[-1]
+
+    def price_estimate(date):
+        """Return price estimate for a given date (string or datetime)."""
+        t = (pd.to_datetime(date) - t0).total_seconds() / (365.25 * 86400)
+        if 0 <= t <= t_end:
+            val = float(spline(t))
+        else:
+            val = model(t, *popt)
+        return round(val, 4)
+
+    def trend_fn(t_arr):
+        return model(t_arr, *popt)
+
+    return price_estimate, trend_fn, t0, t_end, df, popt
+
+# ── 3. Visualisation ───────────────────────────────────────────────────────────
+def plot(df, trend_fn, t0, t_end, popt, output_path="/mnt/user-data/outputs/nat_gas_chart.png"):
+    fig, axes = plt.subplots(2, 1, figsize=(13, 9))
+    fig.patch.set_facecolor("#0d1117")
+    for ax in axes:
+        ax.set_facecolor("#161b22")
+        ax.tick_params(colors="#c9d1d9")
+        ax.xaxis.label.set_color("#c9d1d9")
+        ax.yaxis.label.set_color("#c9d1d9")
+        ax.title.set_color("#e6edf3")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#30363d")
+
+    BLUE   = "#58a6ff"
+    ORANGE = "#f78166"
+    GREEN  = "#3fb950"
+    GREY   = "#484f58"
+
+    # ── Panel 1: Full timeline with extrapolation ──────────────────────────────
+    ax1 = axes[0]
+    ax1.set_title("Natural Gas Prices – History & 12-Month Extrapolation", fontsize=13, pad=10)
+
+    # Observed data
+    ax1.plot(df["Date"], df["Price"], "o-", color=BLUE, lw=2, ms=5,
+             label="Observed monthly prices", zorder=3)
+
+    # Trend + seasonal model across full range
+    t_full = np.linspace(-0.05, t_end + 1.05, 500)
+    dates_full = [t0 + pd.Timedelta(days=t * 365.25) for t in t_full]
+
+    def model(t, a, b, c, d):
+        return a + b * t + c * np.sin(2 * np.pi * t) + d * np.cos(2 * np.pi * t)
+
+    prices_full = model(t_full, *popt)
+    ax1.plot(dates_full, prices_full, "--", color=GREY, lw=1.4, label="Trend + seasonal model", zorder=2)
+
+    # Extrapolation zone
+    t_extrap = np.linspace(t_end, t_end + 1.02, 200)
+    dates_extrap = [t0 + pd.Timedelta(days=t * 365.25) for t in t_extrap]
+    prices_extrap = model(t_extrap, *popt)
+    ax1.plot(dates_extrap, prices_extrap, "-", color=ORANGE, lw=2.5,
+             label="Extrapolated (next 12 months)", zorder=3)
+    ax1.axvspan(df["Date"].iloc[-1], dates_extrap[-1], alpha=0.08, color=ORANGE, label="_nolegend_")
+    ax1.axvline(df["Date"].iloc[-1], color=ORANGE, lw=1, ls=":", alpha=0.7)
+    ax1.text(df["Date"].iloc[-1] + pd.Timedelta(days=5), df["Price"].min() + 0.05,
+             "  Extrapolation →", color=ORANGE, fontsize=8, va="bottom")
+
+    ax1.set_ylabel("Price ($/MMBtu)", fontsize=10)
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=4))
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=30, ha="right")
+    ax1.legend(fontsize=9, facecolor="#21262d", edgecolor="#30363d", labelcolor="#c9d1d9")
+    ax1.grid(True, color="#21262d", lw=0.6)
+    ax1.set_xlim(df["Date"].iloc[0] - pd.Timedelta(days=20), dates_extrap[-1])
+
+    # ── Panel 2: Seasonal decomposition (avg by month) ─────────────────────────
+    ax2 = axes[1]
+    ax2.set_title("Seasonal Pattern – Average Price by Calendar Month", fontsize=13, pad=10)
+
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec"]
+    df_m = df.copy()
+    df_m["Month"] = df_m["Date"].dt.month
+    monthly = df_m.groupby("Month")["Price"].agg(["mean", "std"]).reset_index()
+
+    bars = ax2.bar(monthly["Month"], monthly["mean"],
+                   color=[GREEN if m in [11,12,1,2,3] else BLUE for m in monthly["Month"]],
+                   alpha=0.85, width=0.6, zorder=2)
+    ax2.errorbar(monthly["Month"], monthly["mean"], yerr=monthly["std"],
+                 fmt="none", color="#c9d1d9", capsize=4, lw=1.5, zorder=3)
+
+    # Overlay the seasonal curve from model (de-trended to mean level)
+    t_season = np.linspace(0, 1, 300)
+    a, b, c, d = popt
+    seasonal_curve = a + b * (t_end / 2) + c * np.sin(2 * np.pi * t_season) + d * np.cos(2 * np.pi * t_season)
+    month_x = t_season * 12 + 1
+    ax2.plot(month_x, seasonal_curve, color=ORANGE, lw=2, label="Fitted seasonal curve", zorder=4)
+
+    ax2.set_xticks(range(1, 13))
+    ax2.set_xticklabels(month_labels, fontsize=9)
+    ax2.set_ylabel("Average Price ($/MMBtu)", fontsize=10)
+    ax2.legend(fontsize=9, facecolor="#21262d", edgecolor="#30363d", labelcolor="#c9d1d9")
+    ax2.grid(True, axis="y", color="#21262d", lw=0.6)
+
+    # Annotate winter/summer zones
+    ax2.axvspan(0.5, 3.5, alpha=0.07, color=GREEN, label="_")
+    ax2.axvspan(10.5, 12.5, alpha=0.07, color=GREEN, label="_")
+    ax2.text(2, ax2.get_ylim()[0] + 0.05, "Winter peak", color=GREEN, fontsize=8, ha="center")
+    ax2.text(5.5, ax2.get_ylim()[0] + 0.05, "Summer trough", color=BLUE, fontsize=8, ha="center")
+
+    plt.tight_layout(pad=2.5)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"Chart saved → {output_path}")
+
+# ── 4. Main ────────────────────────────────────────────────────────────────────
+def main():
+    df = load_data()
+    price_estimate, trend_fn, t0, t_end, df_full, popt = build_model(df)
+
+    # If a date argument is passed, just return the estimate
+    if len(sys.argv) > 1:
+        date_str = sys.argv[1]
+        try:
+            est = price_estimate(date_str)
+            print(f"Estimated natural gas price on {date_str}: ${est:.4f} / MMBtu")
+        except Exception as e:
+            print(f"Error: {e}")
+        return
+
+    # Otherwise run demo + plot
+    plot(df_full, trend_fn, t0, t_end, popt)
+
+    print("\n── Natural Gas Price Estimator ────────────────────────────")
+    demo_dates = [
+        "2021-03-15",   # historical interpolation
+        "2022-08-10",   # historical interpolation
+        "2023-12-25",   # historical interpolation
+        "2024-06-15",   # near end of data
+        "2025-01-31",   # extrapolation
+        "2025-06-30",   # extrapolation
+        "2025-09-30",   # extrapolation (boundary)
+    ]
+    for d in demo_dates:
+        est = price_estimate(d)
+        region = "interpolated" if pd.to_datetime(d) <= df["Date"].iloc[-1] else "extrapolated"
+        print(f"  {d}  →  ${est:>7.4f} / MMBtu  [{region}]")
+
+    print("\nModel coefficients:")
+    a, b, c, d = popt
+    print(f"  Baseline (a):     {a:.4f}")
+    print(f"  Annual trend (b): +{b:.4f} per year")
+    print(f"  Seasonal sin (c): {c:.4f}")
+    print(f"  Seasonal cos (d): {d:.4f}")
+    print(f"\nData range: {df['Date'].iloc[0].date()} → {df['Date'].iloc[-1].date()}")
+    print(f"Extrapolation valid up to: {(df['Date'].iloc[-1] + pd.DateOffset(years=1)).date()}")
+    print("──────────────────────────────────────────────────────────\n")
+
+if __name__ == "__main__":
+    main()
