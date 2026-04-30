@@ -1,0 +1,200 @@
+# ==========================================================
+# CUSTOMER CHURN PREDICTION MODEL
+# Lloyds Banking Group - Machine Learning Task
+# ==========================================================
+
+# Import Libraries
+import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+from sklearn.ensemble import RandomForestClassifier
+
+# ==========================================================
+# LOAD DATA
+# ==========================================================
+
+file_path = "Customer_Churn_Data_Large.xlsx"
+
+# Load sheets
+demographics = pd.read_excel(file_path, sheet_name="Customer_Demographics")
+transactions = pd.read_excel(file_path, sheet_name="Transaction_History")
+service = pd.read_excel(file_path, sheet_name="Customer_Service")
+activity = pd.read_excel(file_path, sheet_name="Online_Activity")
+churn = pd.read_excel(file_path, sheet_name="Churn_Status")
+
+# ==========================================================
+# FEATURE ENGINEERING
+# ==========================================================
+
+# Aggregate transactions
+txn_summary = transactions.groupby("CustomerID").agg({
+    "TransactionAmount": ["sum", "mean", "count"]
+})
+
+txn_summary.columns = ["TotalSpend", "AvgSpend", "TxnCount"]
+txn_summary.reset_index(inplace=True)
+
+# Merge all tables
+df = demographics.merge(txn_summary, on="CustomerID", how="left")
+df = df.merge(service, on="CustomerID", how="left")
+df = df.merge(activity, on="CustomerID", how="left")
+df = df.merge(churn, on="CustomerID", how="left")
+
+# Fill missing values
+df.fillna(0, inplace=True)
+
+# ==========================================================
+# TARGET VARIABLE
+# ==========================================================
+
+y = df["Churn"]
+X = df.drop(columns=["CustomerID", "Churn"])
+
+# ==========================================================
+# IDENTIFY COLUMN TYPES
+# ==========================================================
+
+categorical_cols = X.select_dtypes(include=["object"]).columns.tolist()
+numerical_cols = X.select_dtypes(exclude=["object"]).columns.tolist()
+
+# ==========================================================
+# PREPROCESSING PIPELINE
+# ==========================================================
+
+from sklearn.preprocessing import OneHotEncoder
+
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numerical_cols),
+        ("cat", categorical_transformer, categorical_cols)
+    ]
+)
+
+# ==========================================================
+# MODEL SELECTION: RANDOM FOREST
+# ==========================================================
+
+rf_model = RandomForestClassifier(random_state=42)
+
+pipeline = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("model", rf_model)
+])
+
+# ==========================================================
+# TRAIN TEST SPLIT
+# ==========================================================
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
+)
+
+# ==========================================================
+# HYPERPARAMETER TUNING
+# ==========================================================
+
+param_grid = {
+    "model__n_estimators": [100, 200],
+    "model__max_depth": [5, 10, None],
+    "model__min_samples_split": [2, 5]
+}
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+grid_search = GridSearchCV(
+    pipeline,
+    param_grid,
+    cv=cv,
+    scoring="roc_auc",
+    n_jobs=-1
+)
+
+grid_search.fit(X_train, y_train)
+
+best_model = grid_search.best_estimator_
+
+print("Best Parameters:")
+print(grid_search.best_params_)
+
+# ==========================================================
+# MODEL EVALUATION
+# ==========================================================
+
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)[:, 1]
+
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred))
+
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+
+print("ROC-AUC Score:", roc_auc_score(y_test, y_prob))
+print("Precision:", precision_score(y_test, y_pred))
+print("Recall:", recall_score(y_test, y_pred))
+print("F1 Score:", f1_score(y_test, y_pred))
+
+# ==========================================================
+# FEATURE IMPORTANCE
+# ==========================================================
+
+model = best_model.named_steps["model"]
+
+print("\nTop Important Features:")
+importances = model.feature_importances_
+
+# After preprocessing, feature names:
+encoded_features = best_model.named_steps["preprocessor"].get_feature_names_out()
+
+feature_df = pd.DataFrame({
+    "Feature": encoded_features,
+    "Importance": importances
+}).sort_values(by="Importance", ascending=False)
+
+print(feature_df.head(10))
+
+# ==========================================================
+# BUSINESS APPLICATION
+# ==========================================================
+
+# Predict churn probability for all customers
+df["Churn_Probability"] = best_model.predict_proba(X)[:, 1]
+
+# High-risk customers
+high_risk = df[df["Churn_Probability"] > 0.70]
+
+print("\nHigh Risk Customers:")
+print(high_risk[["CustomerID", "Churn_Probability"]].head())
+
+# Save predictions
+df.to_csv("customer_churn_predictions.csv", index=False)
+
+print("\nPredictions saved successfully.")
