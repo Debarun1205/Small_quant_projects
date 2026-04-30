@@ -1,0 +1,389 @@
+"""
+Natural Gas Storage Contract Pricing Model
+===========================================
+Prices a physical gas storage contract by simulating all cash flows:
+  - Commodity purchases on injection dates (cost)
+  - Commodity sales on withdrawal dates (revenue)
+  - Storage costs accrued per unit of gas held per day
+
+Assumptions:
+  - Zero interest rates (no discounting)
+  - No transport delays
+  - Market holidays / weekends not accounted for
+  - Injection and withdrawal happen instantly on the given dates
+  - Storage cost is charged daily on the volume currently held
+  - Price estimator from nat_gas_pricer.py is used when prices are not supplied
+"""
+
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.interpolate import CubicSpline
+from scipy.optimize import curve_fit
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  Price estimator (carried forward from previous task)
+# ══════════════════════════════════════════════════════════════════════════════
+_DATA_PATH = "/mnt/user-data/uploads/Nat_Gas.csv"
+_price_fn  = None          # cached after first build
+
+def _build_price_estimator(path=_DATA_PATH):
+    df = pd.read_csv(path)
+    df.columns = ["Date", "Price"]
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=False)
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    t0 = df["Date"].iloc[0]
+
+    def _to_t(dates):
+        return (pd.to_datetime(dates) - t0).dt.total_seconds() / (365.25 * 86400)
+
+    df["t"] = _to_t(df["Date"])
+    t_end   = df["t"].iloc[-1]
+
+    def _model(t, a, b, c, d):
+        return a + b*t + c*np.sin(2*np.pi*t) + d*np.cos(2*np.pi*t)
+
+    popt, _ = curve_fit(_model, df["t"].values, df["Price"].values, p0=[10, 0.5, 0.3, 0.3])
+    spline  = CubicSpline(df["t"].values, df["Price"].values, extrapolate=False)
+
+    def price_estimate(date):
+        t = (pd.to_datetime(date) - t0).total_seconds() / (365.25 * 86400)
+        val = float(spline(t)) if (0 <= t <= t_end) else float(_model(t, *popt))
+        return round(val, 4)
+
+    return price_estimate
+
+
+def get_price(date, price_override=None):
+    """Return price for *date*. If price_override is given, use that instead."""
+    if price_override is not None:
+        return float(price_override)
+    global _price_fn
+    if _price_fn is None:
+        _price_fn = _build_price_estimator()
+    return _price_fn(date)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  Core pricing function
+# ══════════════════════════════════════════════════════════════════════════════
+def price_storage_contract(
+    injection_dates,
+    withdrawal_dates,
+    injection_rate,        # MMBtu per day (max gas that can be injected/day)
+    withdrawal_rate,       # MMBtu per day (max gas that can be withdrawn/day)
+    max_volume,            # MMBtu  (maximum storage capacity)
+    storage_cost_rate,     # $/MMBtu/day  (daily holding cost per unit stored)
+    injection_prices=None,
+    withdrawal_prices=None,
+    verbose=True,
+):
+    """
+    Price a natural gas storage contract.
+
+    Parameters
+    ----------
+    injection_dates   : list of str/date  – dates on which gas is injected
+    withdrawal_dates  : list of str/date  – dates on which gas is withdrawn
+    injection_prices  : list of float | None  – override commodity price for each
+                        injection date; None → use the price model
+    withdrawal_prices : list of float | None  – same for withdrawal dates
+    injection_rate    : float  – max MMBtu injected per day (caps volume per event)
+    withdrawal_rate   : float  – max MMBtu withdrawn per day (caps vol per event)
+    max_volume        : float  – storage capacity in MMBtu
+    storage_cost_rate : float  – $/MMBtu/day charged on the held volume
+    verbose           : bool   – print a detailed cash-flow table
+
+    Returns
+    -------
+    dict with keys:
+        contract_value      – net P&L of the contract ($)
+        gross_revenue       – total proceeds from withdrawals ($)
+        gross_cost          – total commodity purchase costs ($)
+        storage_cost        – total storage fees paid ($)
+        cashflow_table      – pd.DataFrame of every event
+        volume_profile      – pd.DataFrame of daily volume & cumulative storage cost
+    """
+    # ── parse & sort dates ────────────────────────────────────────────────────
+    inj_dates  = sorted(pd.to_datetime(injection_dates))
+    with_dates = sorted(pd.to_datetime(withdrawal_dates))
+
+    n_inj  = len(inj_dates)
+    n_with = len(with_dates)
+
+    if injection_prices is None:
+        injection_prices = [None] * n_inj
+    if withdrawal_prices is None:
+        withdrawal_prices = [None] * n_with
+
+    if len(injection_prices) != n_inj:
+        raise ValueError("injection_prices length must match injection_dates")
+    if len(withdrawal_prices) != n_with:
+        raise ValueError("withdrawal_prices length must match withdrawal_dates")
+
+    # ── build event timeline ──────────────────────────────────────────────────
+    events = []
+    for dt, px in zip(inj_dates, injection_prices):
+        events.append({"date": dt, "type": "inject",   "price_override": px})
+    for dt, px in zip(with_dates, withdrawal_prices):
+        events.append({"date": dt, "type": "withdraw", "price_override": px})
+    events.sort(key=lambda e: e["date"])
+
+    # ── simulate flows ────────────────────────────────────────────────────────
+    volume_held   = 0.0         # current volume in storage (MMBtu)
+    gross_revenue = 0.0
+    gross_cost    = 0.0
+    storage_cost  = 0.0
+    prev_date     = None
+
+    cashflow_rows = []
+
+    for ev in events:
+        ev_date  = ev["date"]
+        ev_type  = ev["type"]
+        ev_price = get_price(ev_date, ev["price_override"])
+
+        # ── accrue storage cost since last event ──────────────────────────────
+        if prev_date is not None and volume_held > 0:
+            days_held  = (ev_date - prev_date).days
+            period_cost = volume_held * storage_cost_rate * days_held
+            storage_cost += period_cost
+        else:
+            period_cost = 0.0
+
+        # ── determine volume transacted ───────────────────────────────────────
+        if ev_type == "inject":
+            # How many days between this and the *next* injection (or end)?
+            # For simplicity: volume = injection_rate * 1 day (single-day event)
+            # but capped to available capacity.
+            injectable = min(injection_rate, max_volume - volume_held)
+            if injectable <= 0:
+                injectable = 0.0
+                note = "SKIPPED – storage full"
+            else:
+                note = ""
+            volume_transacted = injectable
+            commodity_cf      = -volume_transacted * ev_price   # cost  (negative)
+            gross_cost       += abs(commodity_cf)
+            volume_held      += volume_transacted
+
+        else:  # withdraw
+            withdrawable = min(withdrawal_rate, volume_held)
+            if withdrawable <= 0:
+                withdrawable = 0.0
+                note = "SKIPPED – storage empty"
+            else:
+                note = ""
+            volume_transacted = withdrawable
+            commodity_cf      = volume_transacted * ev_price    # revenue (positive)
+            gross_revenue    += commodity_cf
+            volume_held      -= volume_transacted
+
+        if volume_held < 0:
+            volume_held = 0.0     # floating point guard
+
+        cashflow_rows.append({
+            "Date":              ev_date.strftime("%Y-%m-%d"),
+            "Event":             ev_type.capitalize(),
+            "Price ($/MMBtu)":   round(ev_price, 4),
+            "Volume (MMBtu)":    round(volume_transacted, 2),
+            "Commodity CF ($)":  round(commodity_cf, 2),
+            "Storage Cost ($)":  round(-period_cost, 2),
+            "Volume Held After": round(volume_held, 2),
+            "Note":              note,
+        })
+
+        prev_date = ev_date
+
+    # ── final storage cost after last event until last withdrawal ─────────────
+    # (no cost accrues after the last withdrawal since gas is gone)
+
+    cashflow_table = pd.DataFrame(cashflow_rows)
+    contract_value = gross_revenue - gross_cost - storage_cost
+
+    result = {
+        "contract_value":  round(contract_value, 2),
+        "gross_revenue":   round(gross_revenue, 2),
+        "gross_cost":      round(gross_cost, 2),
+        "storage_cost":    round(storage_cost, 2),
+        "cashflow_table":  cashflow_table,
+    }
+
+    if verbose:
+        _print_report(result, max_volume, injection_rate, withdrawal_rate, storage_cost_rate)
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  Pretty printer
+# ══════════════════════════════════════════════════════════════════════════════
+def _print_report(result, max_volume, inj_rate, with_rate, sc_rate):
+    sep = "─" * 68
+    print(f"\n{'═'*68}")
+    print(" NATURAL GAS STORAGE CONTRACT — PRICING REPORT")
+    print(f"{'═'*68}")
+    print(f"  Max capacity   : {max_volume:>12,.0f} MMBtu")
+    print(f"  Injection rate : {inj_rate:>12,.0f} MMBtu / day")
+    print(f"  Withdrawal rate: {with_rate:>12,.0f} MMBtu / day")
+    print(f"  Storage cost   : {sc_rate:>12.4f} $ / MMBtu / day")
+    print(sep)
+    print("\n  CASH FLOW TABLE")
+    df = result["cashflow_table"].copy()
+    # align columns for display
+    with pd.option_context("display.max_columns", 20, "display.width", 120):
+        print(df.to_string(index=False))
+    print(sep)
+    print(f"  Gross Revenue (withdrawals) : ${result['gross_revenue']:>12,.2f}")
+    print(f"  Gross Cost    (injections)  : ${result['gross_cost']:>12,.2f}")
+    print(f"  Storage Costs (holding)     : ${result['storage_cost']:>12,.2f}")
+    print(sep)
+    sign = "+" if result["contract_value"] >= 0 else ""
+    print(f"  CONTRACT VALUE              : {sign}${result['contract_value']:>11,.2f}")
+    print(f"{'═'*68}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  Visualisation helper
+# ══════════════════════════════════════════════════════════════════════════════
+def plot_contract(results_list, labels, output_path="/mnt/user-data/outputs/gas_contract_chart.png"):
+    """Plot volume profile and cumulative P&L for one or more scenarios."""
+    n = len(results_list)
+    fig, axes = plt.subplots(n, 2, figsize=(15, 4.5 * n))
+    if n == 1:
+        axes = [axes]
+
+    fig.patch.set_facecolor("#0d1117")
+    BLUE, GREEN, RED, ORANGE = "#58a6ff", "#3fb950", "#f78166", "#e3b341"
+
+    for idx, (res, label) in enumerate(zip(results_list, labels)):
+        ax_vol, ax_cf = axes[idx]
+        for ax in (ax_vol, ax_cf):
+            ax.set_facecolor("#161b22")
+            ax.tick_params(colors="#c9d1d9", labelsize=8)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#30363d")
+            ax.grid(True, color="#21262d", lw=0.6)
+
+        df = res["cashflow_table"].copy()
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date")
+
+        # Volume profile (step)
+        ax_vol.set_title(f"{label} — Volume in Storage", color="#e6edf3", fontsize=10, pad=6)
+        dates_ext = list(df["Date"])
+        vols_ext  = list(df["Volume Held After"])
+        # prepend start
+        if dates_ext:
+            dates_ext = [dates_ext[0] - pd.Timedelta(days=1)] + dates_ext
+            vols_ext  = [0] + vols_ext
+        ax_vol.step(dates_ext, vols_ext, where="post", color=BLUE, lw=2)
+        ax_vol.fill_between(dates_ext, vols_ext, step="post", alpha=0.18, color=BLUE)
+        ax_vol.set_ylabel("MMBtu held", color="#c9d1d9", fontsize=9)
+        ax_vol.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        plt.setp(ax_vol.xaxis.get_majorticklabels(), rotation=25, ha="right", color="#c9d1d9")
+
+        # Mark injection / withdrawal events
+        for _, row in df.iterrows():
+            color = GREEN if row["Event"] == "Inject" else RED
+            ax_vol.axvline(row["Date"], color=color, lw=1.2, ls="--", alpha=0.6)
+            ax_vol.text(row["Date"], ax_vol.get_ylim()[1] * 0.92,
+                        "I" if row["Event"] == "Inject" else "W",
+                        color=color, fontsize=7, ha="center")
+
+        # Cumulative P&L bar chart
+        ax_cf.set_title(f"{label} — Cumulative Cash Flows", color="#e6edf3", fontsize=10, pad=6)
+        categories = ["Gross Revenue", "Gross Cost", "Storage Cost", "Contract Value"]
+        values     = [res["gross_revenue"], -res["gross_cost"], -res["storage_cost"], res["contract_value"]]
+        colors     = [GREEN, RED, ORANGE, BLUE if res["contract_value"] >= 0 else RED]
+        bars = ax_cf.bar(categories, values, color=colors, alpha=0.85, width=0.5)
+        for bar, val in zip(bars, values):
+            ax_cf.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (max(values)*0.01),
+                       f"${val:,.0f}", ha="center", va="bottom", color="#c9d1d9", fontsize=8)
+        ax_cf.axhline(0, color="#484f58", lw=0.8)
+        ax_cf.set_ylabel("USD ($)", color="#c9d1d9", fontsize=9)
+        ax_cf.tick_params(axis="x", colors="#c9d1d9", labelsize=8)
+
+    plt.suptitle("Natural Gas Storage Contract Pricing", color="#e6edf3", fontsize=13, y=1.01)
+    plt.tight_layout(pad=2)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"Chart saved → {output_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  Test scenarios
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+
+    # ── Scenario A: Classic "buy summer, sell winter" ─────────────────────────
+    # Inject cheap gas in summer months, withdraw at winter premium.
+    print("\n" + "█"*68)
+    print(" SCENARIO A: Classic Summer Inject / Winter Withdraw")
+    print("█"*68)
+    res_a = price_storage_contract(
+        injection_dates   = ["2023-05-31", "2023-06-30", "2023-07-31", "2023-08-31"],
+        withdrawal_dates  = ["2023-11-30", "2023-12-31", "2024-01-31", "2024-02-29"],
+        injection_rate    = 50_000,  # MMBtu / day
+        withdrawal_rate   = 50_000,
+        max_volume        = 500_000, # MMBtu
+        storage_cost_rate = 0.005,   # $0.005 / MMBtu / day
+    )
+
+    # ── Scenario B: Tight capacity constraint ─────────────────────────────────
+    # Same structure but max_volume forces some injections to be skipped.
+    print("\n" + "█"*68)
+    print(" SCENARIO B: Tight Capacity Constraint (max 40,000 MMBtu)")
+    print("█"*68)
+    res_b = price_storage_contract(
+        injection_dates   = ["2023-05-31", "2023-06-30", "2023-07-31"],
+        withdrawal_dates  = ["2023-11-30", "2023-12-31"],
+        injection_rate    = 30_000,
+        withdrawal_rate   = 30_000,
+        max_volume        = 40_000,
+        storage_cost_rate = 0.008,
+    )
+
+    # ── Scenario C: Manual price overrides + extrapolated dates ───────────────
+    # Inject in early 2025 (model extrapolated), withdraw at manually quoted prices.
+    print("\n" + "█"*68)
+    print(" SCENARIO C: Manual Price Overrides + Future Extrapolated Dates")
+    print("█"*68)
+    res_c = price_storage_contract(
+        injection_dates   = ["2025-02-28", "2025-03-31"],
+        withdrawal_dates  = ["2025-08-31", "2025-09-30"],
+        injection_prices  = [12.50, 12.80],   # manual quotes (e.g. from broker)
+        withdrawal_prices = [13.50, 13.20],
+        injection_rate    = 100_000,
+        withdrawal_rate   = 100_000,
+        max_volume        = 300_000,
+        storage_cost_rate = 0.004,
+    )
+
+    # ── Scenario D: Unprofitable contract (poor timing) ───────────────────────
+    print("\n" + "█"*68)
+    print(" SCENARIO D: Unfavourable Timing (inject winter, withdraw summer)")
+    print("█"*68)
+    res_d = price_storage_contract(
+        injection_dates   = ["2023-12-31", "2024-01-31"],
+        withdrawal_dates  = ["2024-05-31", "2024-06-30"],
+        injection_rate    = 75_000,
+        withdrawal_rate   = 75_000,
+        max_volume        = 200_000,
+        storage_cost_rate = 0.006,
+    )
+
+    # ── Plot all scenarios ────────────────────────────────────────────────────
+    plot_contract(
+        [res_a, res_b, res_c, res_d],
+        ["A: Summer→Winter (Classic)", "B: Tight Capacity",
+         "C: Manual Prices + Future Dates", "D: Unfavourable (Winter→Summer)"],
+    )
